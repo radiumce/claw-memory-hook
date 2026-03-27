@@ -1,17 +1,8 @@
 ---
-name: xmemory-hook
+name: claw-memory-hook
 description: "Pulls OpenClaw session logs and syncs them to XMemory"
 homepage: ""
-metadata:
-  {
-    "openclaw":
-      {
-        "emoji": "🧠",
-        "events": ["command:new", "command:reset", "message:receive"],
-        "requires": { "config": ["workspace.dir"] },
-        "install": [{ "id": "custom", "kind": "local", "label": "XMemory Integration Hook" }],
-      },
-  }
+metadata: { "openclaw": { "emoji": "🧠", "events": ["command:new", "command:reset", "message:received"], "install": [{ "id": "custom", "kind": "local", "label": "XMemory Integration Hook" }] } }
 ---
 
 # XMemory Integration Hook
@@ -56,20 +47,18 @@ The hook sends a JSON POST request to your webhook with the following structure:
 
 ## Configuration
 
-### 1. Webhook Endpoint
-You must configure the target webhook URL via the environment variable where OpenClaw runs:
-```bash
-export XMEMORY_WEBHOOK_URL="http://127.0.0.1:8000/hooks/claw-memory"
-```
-
-### 2. Message Role Filtering
-By default, the hook intercepts `user` and `assistant` messages. To change this, edit the `extraction_rule.json` file located in the same directory as the hook code:
+### 1. Webhook Endpoint and Configuration
+You can configure the target webhook URL and message roles via the `config.json` file located in the same directory as the hook code:
 
 ```json
 {
-  "allowedRoles": ["user", "assistant"]
+  "allowedRoles": ["user", "assistant"],
+  "xmemoryApiUrl": "http://127.0.0.1:8000/api/v1/memory/push"
 }
 ```
+
+If `xmemoryApiUrl` is not set or the file is missing, it will securely fallback to the environment variable `XMEMORY_WEBHOOK_URL` (or `http://127.0.0.1:8000/api/v1/memory/push`).
+By default, the hook intercepts `user` and `assistant` messages. 
 
 ## State Management
 
