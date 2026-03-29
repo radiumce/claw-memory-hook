@@ -16,6 +16,7 @@ interface Checkpoint {
   lastSessionFile: string;
   lastMessageId: string | null;
   syncedFiles?: string[]; // Track which files have been fully synced (for initial sync)
+  fileCheckpoints?: Record<string, string>; // Per-file last message ID for peer-isolation support
 }
 
 // -------------------------------------------------------------
@@ -61,6 +62,24 @@ async function loadCheckpoint(checkpointPath: string): Promise<Checkpoint> {
 
 async function saveCheckpoint(checkpointPath: string, checkpoint: Checkpoint): Promise<void> {
   try {
+    // Prune fileCheckpoints: remove entries for deleted files or files inactive for over 30 days
+    if (checkpoint.fileCheckpoints) {
+      const STALE_THRESHOLD_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+      const now = Date.now();
+      const pruned: Record<string, string> = {};
+      for (const [filePath, msgId] of Object.entries(checkpoint.fileCheckpoints)) {
+        try {
+          const stat = await fs.stat(filePath);
+          if (now - stat.mtimeMs < STALE_THRESHOLD_MS) {
+            pruned[filePath] = msgId;
+          }
+        } catch {
+          // File no longer exists, drop from checkpoint
+        }
+      }
+      checkpoint.fileCheckpoints = Object.keys(pruned).length > 0 ? pruned : undefined;
+    }
+
     const dir = path.dirname(checkpointPath);
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(checkpointPath, JSON.stringify(checkpoint, null, 2), "utf-8");
@@ -251,6 +270,7 @@ const xmemoryHookHandler: HookHandler = async (event) => {
 
       const historicalFiles = await findSessionFilesInRange(sessionsDir, config.initialSyncDays);
       const syncedFiles: string[] = [];
+      const initFileCheckpoints: Record<string, string> = {};
 
       for (const filePath of historicalFiles) {
         const { messages, newLastId } = await pullMessagesFrom(
@@ -264,21 +284,21 @@ const xmemoryHookHandler: HookHandler = async (event) => {
           await sendToWebhook(config, agentId, fileName, event, messages);
         }
 
+        if (newLastId) {
+          initFileCheckpoints[filePath] = newLastId;
+        }
+
         syncedFiles.push(filePath);
         console.log(`[xmemory-hook] Initial sync: processed ${filePath} (${messages.length} messages)`);
       }
 
       const lastFile = historicalFiles[historicalFiles.length - 1];
-      if (lastFile) {
-        const { newLastId } = await pullMessagesFrom(
-          lastFile,
-          { lastSessionFile: "", lastMessageId: null, syncedFiles: [] },
-          config.allowedRoles
-        );
-        await saveCheckpoint(checkpointFile, { lastSessionFile: lastFile, lastMessageId: newLastId, syncedFiles });
-      } else {
-        await saveCheckpoint(checkpointFile, { lastSessionFile: "", lastMessageId: null, syncedFiles: [] });
-      }
+      await saveCheckpoint(checkpointFile, {
+        lastSessionFile: lastFile ?? "",
+        lastMessageId: lastFile ? (initFileCheckpoints[lastFile] ?? null) : null,
+        syncedFiles,
+        fileCheckpoints: initFileCheckpoints,
+      });
 
       console.log(`[xmemory-hook] Initial sync complete. Synced ${syncedFiles.length} files.`);
     }
@@ -362,11 +382,18 @@ const xmemoryHookHandler: HookHandler = async (event) => {
         await sendToWebhook(config, agentId, prevSessionId, event, remainingMessages);
       }
 
-      // Update checkpoint to mark previous session as fully processed
+      // Update checkpoint to mark previous session as flushed up to this point
+      // Note: do NOT remove from fileCheckpoints — the previous session may still be active
+      // (e.g. another peer's session picked up via mtime heuristic). Stale entries are
+      // cleaned by fs.access pruning in saveCheckpoint when the file is eventually deleted.
       activeCheckpoint = {
         ...freshCheckpoint,
         lastSessionFile: previousSessionFile,
         lastMessageId: prevLastId ?? freshCheckpoint.lastMessageId,
+        fileCheckpoints: {
+          ...(freshCheckpoint.fileCheckpoints ?? {}),
+          [previousSessionFile]: prevLastId ?? freshCheckpoint.lastMessageId ?? "",
+        },
       };
       await saveCheckpoint(checkpointFile, activeCheckpoint);
       console.log(`[xmemory-hook] ✅ Previous session flushed and checkpoint updated`);
@@ -376,15 +403,24 @@ const xmemoryHookHandler: HookHandler = async (event) => {
     // Process current session file
     // ---------------------------------------------------------------
     // For a new session file (different from checkpoint), read from the beginning
+    // On session switch, resume from per-file checkpoint instead of re-reading from start
     const checkpointForCurrent: Checkpoint = isSessionSwitch
-      ? { lastSessionFile: "", lastMessageId: null, syncedFiles: [] }
+      ? { lastSessionFile: currentSessionFile, lastMessageId: activeCheckpoint.fileCheckpoints?.[currentSessionFile] ?? null, syncedFiles: [] }
       : activeCheckpoint;
 
     const { messages, newLastId } = await pullMessagesFrom(currentSessionFile, checkpointForCurrent, config.allowedRoles);
 
     if (messages.length === 0) {
       if (newLastId !== activeCheckpoint.lastMessageId || currentSessionFile !== activeCheckpoint.lastSessionFile) {
-        await saveCheckpoint(checkpointFile, { ...activeCheckpoint, lastSessionFile: currentSessionFile, lastMessageId: newLastId });
+        await saveCheckpoint(checkpointFile, {
+          ...activeCheckpoint,
+          lastSessionFile: currentSessionFile,
+          lastMessageId: newLastId,
+          fileCheckpoints: {
+            ...(activeCheckpoint.fileCheckpoints ?? {}),
+            ...(newLastId ? { [currentSessionFile]: newLastId } : {}),
+          },
+        });
       }
       return;
     }
@@ -396,7 +432,11 @@ const xmemoryHookHandler: HookHandler = async (event) => {
     await saveCheckpoint(checkpointFile, {
       ...activeCheckpoint,
       lastSessionFile: currentSessionFile,
-      lastMessageId: newLastId
+      lastMessageId: newLastId,
+      fileCheckpoints: {
+        ...(activeCheckpoint.fileCheckpoints ?? {}),
+        ...(newLastId ? { [currentSessionFile]: newLastId } : {}),
+      },
     });
 
   } catch (err) {
