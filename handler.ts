@@ -10,6 +10,7 @@ interface HookConfig {
   allowedRoles: string[];
   xmemoryApiUrl: string;
   initialSyncDays: number; // -1 = all, >0 = only files created within N days
+  namespace?: string; // Optional namespace for separation in xmemory
 }
 
 interface Checkpoint {
@@ -43,6 +44,9 @@ async function loadConfig(): Promise<HookConfig> {
        }
        if (typeof json.initialSyncDays === "number") {
          defaults.initialSyncDays = json.initialSyncDays;
+       }
+       if (typeof json.namespace === "string" && json.namespace.trim() !== "") {
+         defaults.namespace = json.namespace;
        }
     }
   } catch {
@@ -204,7 +208,8 @@ async function sendToWebhook(
     action: event.action,
     agentId,
     sessionId,
-    data: messages
+    data: messages,
+    ...(config.namespace ? { namespace: config.namespace } : {})
   };
 
   if (config.xmemoryApiUrl) {
